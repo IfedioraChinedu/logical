@@ -1,483 +1,433 @@
-/*
-  Master Device Firmware (WiFiManager + Cloud Commands)
-
-  Features:
-  - WiFi provisioning via WiFiManager (captive portal, no hard-coded SSID/PASS)
-  - Device login to backend (/api/device/login) -> device_id, company_id, jwt, jwt_exp
-  - Polls backend for commands (/api/master/commands?device_id=...)
-  - Handles commands:
-      - start_rfid_scan: read RFID, query Supabase customers, show name/balance or "New Tag" and notify backend
-      - show_info: show company/device on LCD
-      - force_wifi_setup: clear WiFi credentials and reboot into config portal
-      - pair_slave: TODO
-  - Sends heartbeat to /api/device/heartbeat
-*/
-
+#include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
+#include <WebServer.h>
 #include <HTTPClient.h>
-#include <WiFiManager.h>   // WiFiManager library
 #include <SPI.h>
 #include <MFRC522.h>
-#include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
 
-// ------------------- PIN CONFIG -------------------
-#define SS_PIN   5   // RFID SDA
-#define RST_PIN  27   // RFID RST
+// ================== RFID PINS ==================
+#define RFID_SS_PIN   5    // SDA / SS (corrected)
+#define RFID_RST_PIN  27
+#define RFID_SCK_PIN  18
+#define RFID_MOSI_PIN 23
+#define RFID_MISO_PIN 19
 
-// ------------------- RFID & LCD -------------------
-MFRC522 rfid(SS_PIN, RST_PIN);
-LiquidCrystal_I2C lcd(0x27, 16, 2); // change to 0x3F if needed
+// ================== BATTERY PIN ================
+#define BATTERY_PIN   34   // ADC from 2x 2.2k divider
 
-// ------------------- WIFI / DEVICE CONFIG -------------------
-WiFiManager wm;
+// ================== LCD ========================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// Each master has a unique serial you assign when you sell it
-String MASTER_SERIAL = "PMT-MASTER-0001";  // TODO: change per device
+// =============== BATTERY ICONS ================
+byte battery0[8] = {B01110,B10001,B10001,B10001,B10001,B10001,B10001,B11111};
+byte battery1[8] = {B01110,B10001,B10001,B10001,B10001,B10001,B11111,B11111};
+byte battery2[8] = {B01110,B10001,B10001,B10001,B10001,B11111,B11111,B11111};
+byte battery3[8] = {B01110,B10001,B10001,B10001,B11111,B11111,B11111,B11111};
+byte battery4[8] = {B01110,B10001,B10001,B11111,B11111,B11111,B11111,B11111};
 
-// Backend base URL (Lovable backend, NOT Supabase direct)
-String API_BASE = "https://djodwbvntdlamhydpuih.supabase.co";  // TODO: change
+// =============== BACKEND CONFIG ===============
+const char* API_BASE = "https://your-backend-url.com";   // TODO: CHANGE THIS
 
-// Supabase project URL (for direct REST customer lookups)
-String SUPABASE_URL = "https://djodwbvntdlamhydpuih.supabase.co";
-String SUPABASE_REST = SUPABASE_URL + String("/rest/v1");
+const char* DEVICE_LOGIN_PATH   = "/api/device/login";
+const char* HEARTBEAT_PATH      = "/api/device/heartbeat";
+const char* NEW_RFID_PATH       = "/api/master/new-rfid";
+const char* COMMANDS_PATH       = "/api/master/commands";
+const char* COMMANDS_ACK_PATH   = "/api/master/commands/ack";
 
-// Safe to store on device (public)
-String SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRqb2R3YnZudGRsYW1oeWRwdWloIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ3MTQ1NTcsImV4cCI6MjA4MDI5MDU1N30.CfCR0UnTusBuc-_Pcaaycd6xyze9lTusEoxEj4hG0rg";  // TODO: change
-
-// ------------------- STATE STORAGE -------------------
+// =============== DEVICE IDENTITY ===============
 Preferences prefs;
+
+String deviceSerial = "MASTER_001";
+String deviceType   = "master";
+
 String deviceId  = "";
 String companyId = "";
 String deviceJWT = "";
-unsigned long jwtExpiry = 0;  // epoch seconds
 
-unsigned long lastCommandPoll = 0;
-unsigned long lastHeartbeat   = 0;
+// Stored WiFi credentials
+String wifiSSID = "";
+String wifiPass = "";
 
-// ------------------- UTILITIES -------------------
+// ================= RFID ========================
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+String lastSentUID = "";
 
-unsigned long nowSeconds() {
-  return millis() / 1000;
+// ================== TIMERS =====================
+unsigned long lastHeartbeatMs   = 0;
+unsigned long lastBatteryMs     = 0;
+unsigned long lastCommandPollMs = 0;
+
+const unsigned long HEARTBEAT_INTERVAL_MS = 60000;
+const unsigned long BATTERY_INTERVAL_MS   = 5000;
+const unsigned long COMMANDS_INTERVAL_MS  = 5000;
+
+// =============== WIFI MANAGER ================
+WebServer server(80);
+bool wifiConfigMode = false;
+
+// =============== UTILS =======================
+
+String getJsonString(const String& json, const String& key) {
+  String pattern = "\"" + key + "\":";
+  int idx = json.indexOf(pattern);
+  if (idx < 0) return "";
+
+  idx += pattern.length();
+  while (json[idx] == ' ') idx++;
+
+  if (json[idx] == '\"') {
+    int start = idx + 1;
+    int end = json.indexOf('\"', start);
+    return json.substring(start, end);
+  }
+
+  int start = idx;
+  int end = json.indexOf(',', start);
+  if (end < 0) end = json.indexOf('}', start);
+  return json.substring(start, end);
 }
 
-void showLCD(const String &line1, const String &line2 = "") {
+void showCentered(String a, String b = "") {
   lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(line1.substring(0, 16));
-  lcd.setCursor(0, 1);
-  lcd.print(line2.substring(0, 16));
+  int s = (16 - a.length()) / 2;
+  lcd.setCursor(max(0, s), 0);
+  lcd.print(a);
+
+  if (b.length()) {
+    int s2 = (16 - b.length()) / 2;
+    lcd.setCursor(max(0, s2), 1);
+    lcd.print(b);
+  }
 }
 
-// Generic HTTPS POST returning body
-String httpPostJSON(String url, String jsonBody, int &httpCodeOut) {
-  HTTPClient http;
-  WiFiClientSecure *client = new WiFiClientSecure;
-  client->setInsecure(); // TODO: use real CA cert in production
+// =============== BATTERY SYSTEM ===============
 
-  http.begin(*client, url);
+bool blinkState = false;
+
+float readBatteryVoltage() {
+  int raw = analogRead(BATTERY_PIN);
+  float v_adc = raw * 3.3 / 4095.0;
+  return v_adc * 2.0;
+}
+
+int batteryPercent(float vbat) {
+  const float VMIN = 3.3;
+  const float VMAX = 4.2;
+  if (vbat <= VMIN) return 0;
+  if (vbat >= VMAX) return 100;
+  return (vbat - VMIN) * 100 / (VMAX - VMIN);
+}
+
+void updateBatteryIcon() {
+  float vbat = readBatteryVoltage();
+  int pct = batteryPercent(vbat);
+  byte icon;
+
+  if (pct <= 5)       icon = 0;
+  else if (pct <= 25) icon = 1;
+  else if (pct <= 50) icon = 2;
+  else if (pct <= 75) icon = 3;
+  else                icon = 4;
+
+  lcd.setCursor(15, 0);
+
+  if (pct < 20) {
+    blinkState = !blinkState;
+    if (blinkState)
+      lcd.write(icon);
+    else
+      lcd.print(" ");
+  } else {
+    lcd.write(icon);
+  }
+}
+
+// =============== NVS LOAD =====================
+
+void loadWifi() {
+  wifiSSID = prefs.getString("wifi_ssid", "");
+  wifiPass = prefs.getString("wifi_pass", "");
+}
+
+void saveWifi(String ssid, String pass) {
+  prefs.putString("wifi_ssid", ssid);
+  prefs.putString("wifi_pass", pass);
+  wifiSSID = ssid;
+  wifiPass = pass;
+}
+
+void loadAuth() {
+  deviceId  = prefs.getString("deviceId", "");
+  companyId = prefs.getString("companyId", "");
+  deviceJWT = prefs.getString("deviceJWT", "");
+}
+
+// =============== HTTP HELPERS =================
+
+bool httpPostJson(const char* path, String body, String &response, bool auth = true) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  http.begin(String(API_BASE) + path);
   http.addHeader("Content-Type", "application/json");
 
-  Serial.println("POST " + url);
-  Serial.println("Body: " + jsonBody);
+  if (auth && deviceJWT.length())
+    http.addHeader("Authorization", "Bearer " + deviceJWT);
 
-  httpCodeOut = http.POST(jsonBody);
-  String payload = http.getString();
+  int code = http.POST(body);
+  if (code <= 0) {
+    http.end();
+    return false;
+  }
 
-  Serial.print("HTTP ");
-  Serial.println(httpCodeOut);
-  Serial.println(payload);
-
+  response = http.getString();
   http.end();
-  delete client;
-
-  return payload;
+  return (code >= 200 && code < 300);
 }
 
-// Generic HTTPS GET returning body (with up to 3 headers)
-String httpGetWithHeaders(String url,
-                          const String &h1k, const String &h1v,
-                          const String &h2k = "", const String &h2v = "",
-                          int *httpCodeOut = nullptr) {
+bool httpGet(String path, String &response) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
   HTTPClient http;
-  WiFiClientSecure *client = new WiFiClientSecure;
-  client->setInsecure();
+  http.begin(path);
 
-  http.begin(*client, url);
-  if (h1k.length() > 0) http.addHeader(h1k, h1v);
-  if (h2k.length() > 0) http.addHeader(h2k, h2v);
-
-  Serial.println("GET " + url);
+  if (deviceJWT.length())
+    http.addHeader("Authorization", "Bearer " + deviceJWT);
 
   int code = http.GET();
-  String payload = http.getString();
-
-  Serial.print("HTTP ");
-  Serial.println(code);
-  Serial.println(payload);
-
-  http.end();
-  delete client;
-
-  if (httpCodeOut) *httpCodeOut = code;
-  return payload;
-}
-
-// ------------------- WIFI WITH WIFIMANAGER -------------------
-
-String getConfigPortalName() {
-  return MASTER_SERIAL + "-Setup";
-}
-
-void setupWiFi() {
-  WiFi.mode(WIFI_STA);
-
-  // Optional: auto-close portal after N seconds (otherwise stays until configured)
-  wm.setConfigPortalTimeout(300); // 5 minutes
-
-  // Called when portal starts
-  wm.setAPCallback([](WiFiManager *wmPtr) {
-    String ssid = wmPtr->getConfigPortalSSID();
-    Serial.println("Config Portal started: " + ssid);
-    // We can't call showLCD directly from lambda easily, so just log here.
-    // On your main code you can show instructions like:
-    // "Connect to: <serial>-Setup" on the LCD at boot.
-  });
-
-  String apName = getConfigPortalName();
-  showLCD("WiFi: connecting", "");
-  Serial.println("Starting WiFi autoConnect with AP: " + apName);
-
-  bool res = wm.autoConnect(apName.c_str());  // blocks until connected or timeout
-
-  if (!res) {
-    Serial.println("WiFiManager: failed or timed out");
-    showLCD("WiFi failed", "Config needed");
-    // Decide what to do here:
-    // - You can reboot and re-open portal
-    // - Or remain in this state until power cycle
-  } else {
-    Serial.println("WiFi connected: " + WiFi.localIP().toString());
-    showLCD("WiFi OK", WiFi.localIP().toString());
-    delay(1000);
+  if (code <= 0) {
+    http.end();
+    return false;
   }
+
+  response = http.getString();
+  http.end();
+  return (code >= 200 && code < 300);
 }
 
-// ------------------- SAVED DEVICE STATE -------------------
+// =============== WIFI CONFIG PORTAL ==========
 
-void loadState() {
-  prefs.begin("masterdev", true); // read-only
-  deviceId  = prefs.getString("device_id", "");
-  companyId = prefs.getString("company_id", "");
-  deviceJWT = prefs.getString("jwt", "");
-  jwtExpiry = prefs.getULong("jwt_exp", 0);
-  prefs.end();
-
-  Serial.println("Loaded from NVS:");
-  Serial.println("deviceId: " + deviceId);
-  Serial.println("companyId: " + companyId);
-  Serial.println("jwt: " + (deviceJWT.length() > 0 ? String("present") : String("empty")));
-  Serial.println("jwtExpiry: " + String(jwtExpiry));
+void handleRoot() {
+  String html = R"(
+  <html><body>
+  <h2>WiFi Setup</h2>
+  <form action="/savewifi" method="POST">
+  SSID:<br><input name="ssid"><br><br>
+  Password:<br><input name="pass" type="password"><br><br>
+  <button>Save & Reboot</button>
+  </form>
+  </body></html>
+  )";
+  server.send(200, "text/html", html);
 }
 
-void saveState() {
-  prefs.begin("masterdev", false);
-  prefs.putString("device_id", deviceId);
-  prefs.putString("company_id", companyId);
-  prefs.putString("jwt", deviceJWT);
-  prefs.putULong("jwt_exp", jwtExpiry);
-  prefs.end();
+void handleSaveWifi() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+
+  saveWifi(ssid, pass);
+
+  server.send(200, "text/plain", "Saved! Rebooting...");
+  delay(800);
+  ESP.restart();
 }
 
-// ------------------- DEVICE LOGIN / JWT -------------------
+void startWiFiAP(String reason) {
+  wifiConfigMode = true;
+
+  WiFi.mode(WIFI_AP);
+  String apName = deviceSerial;
+  WiFi.softAP(apName.c_str(), NULL);
+
+  showCentered("WiFi Setup", apName);
+
+  server.on("/", handleRoot);
+  server.on("/savewifi", HTTP_POST, handleSaveWifi);
+  server.begin();
+
+  Serial.println("AP Mode ON: " + apName + " Reason: " + reason);
+}
+
+bool connectWiFiStored() {
+  if (wifiSSID.length() == 0) return false;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+
+  showCentered("Connecting...", wifiSSID);
+
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 15000)
+    delay(300);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    showCentered("WiFi OK");
+    delay(800);
+    return true;
+  }
+
+  return false;
+}
+
+// =============== LOGIN & HEARTBEAT ==========
 
 bool deviceLogin() {
-  if (WiFi.status() != WL_CONNECTED) {
-    setupWiFi();
-    if (WiFi.status() != WL_CONNECTED) {
-      showLCD("No WiFi", "Login failed");
-      return false;
-    }
-  }
+  String body = "{\"device_serial\":\"" + deviceSerial +
+                "\",\"device_type\":\"master\"}";
 
-  String url = API_BASE + "/api/device/login"; // TODO: must exist on backend
-  String body = "{";
-  body += "\"device_serial\":\"" + MASTER_SERIAL + "\",";
-  body += "\"device_type\":\"master\"";
-  body += "}";
+  String res;
+  if (!httpPostJson(DEVICE_LOGIN_PATH, body, res, false)) return false;
 
-  int code;
-  String resp = httpPostJSON(url, body, code);
-  if (code != 200) {
-    showLCD("Login failed", "HTTP " + String(code));
-    return false;
-  }
+  deviceId  = getJsonString(res, "device_id");
+  companyId = getJsonString(res, "company_id");
+  deviceJWT = getJsonString(res, "jwt");
 
-  // Expect JSON like:
-  // { "device_id":"...", "company_id":"...", "jwt":"...", "jwt_exp": 1700000000 }
-  int didPos = resp.indexOf("\"device_id\":\"");
-  int cidPos = resp.indexOf("\"company_id\":\"");
-  int jwtPos = resp.indexOf("\"jwt\":\"");
-  int expPos = resp.indexOf("\"jwt_exp\":");
+  prefs.putString("deviceId", deviceId);
+  prefs.putString("companyId", companyId);
+  prefs.putString("deviceJWT", deviceJWT);
 
-  if (didPos < 0 || cidPos < 0 || jwtPos < 0 || expPos < 0) {
-    showLCD("Bad login resp", "");
-    Serial.println("Parsing login response failed");
-    return false;
-  }
-
-  didPos += 13;
-  int didEnd = resp.indexOf("\"", didPos);
-  deviceId = resp.substring(didPos, didEnd);
-
-  cidPos += 14;
-  int cidEnd = resp.indexOf("\"", cidPos);
-  companyId = resp.substring(cidPos, cidEnd);
-
-  jwtPos += 7;
-  int jwtEnd = resp.indexOf("\"", jwtPos);
-  deviceJWT = resp.substring(jwtPos, jwtEnd);
-
-  expPos += 10;
-  int expEnd = resp.indexOf("}", expPos);
-  String expStr = resp.substring(expPos, expEnd);
-  jwtExpiry = expStr.toInt();
-
-  saveState();
-  showLCD("Device login OK", "");
-  Serial.println("deviceId=" + deviceId);
-  Serial.println("companyId=" + companyId);
-  Serial.println("jwtExpiry=" + String(jwtExpiry));
-  delay(1000);
+  showCentered("Login OK");
+  delay(600);
   return true;
 }
 
-bool ensureJWT() {
-  if (deviceJWT.length() == 0 || nowSeconds() > jwtExpiry) {
-    Serial.println("JWT missing or expired. Logging in...");
-    return deviceLogin();
-  }
-  return true;
-}
-
-// ------------------- RFID HELPERS -------------------
-
-bool readRFIDUID(String &uidOut) {
-  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
-    return false;
-  }
-
-  uidOut = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    uidOut += String(rfid.uid.uidByte[i], HEX);
-  }
-  uidOut.toUpperCase();
-
-  rfid.PICC_HaltA();
-  return true;
-}
-
-// Check customer on Supabase
-void checkCustomerByRFID(const String &rfidUID) {
-  if (!ensureJWT()) return;
-  if (WiFi.status() != WL_CONNECTED) {
-    showLCD("No WiFi", "Cust lookup");
-    return;
-  }
-
-  String url = SUPABASE_REST + "/customers?select=name,balance&rfid_uid=eq." + rfidUID;
-
-  int code;
-  String resp = httpGetWithHeaders(
-                  url,
-                  "apikey", SUPABASE_ANON_KEY,
-                  "Authorization", "Bearer " + deviceJWT,
-                  &code
-                );
-
-  if (code != 200) {
-    showLCD("Cust lookup err", "HTTP " + String(code));
-    return;
-  }
-
-  if (resp == "[]" || resp.length() < 5) {
-    // Not registered
-    showLCD("New Tag", rfidUID);
-
-    // Notify backend so web UI can pre-fill registration
-    String body = "{";
-    body += "\"rfid_uid\":\"" + rfidUID + "\",";
-    body += "\"master_device_id\":\"" + deviceId + "\"";
-    body += "}";
-
-    int pcode;
-    String url2 = API_BASE + "/api/master/new-rfid"; // TODO: implement backend
-    httpPostJSON(url2, body, pcode);
-    return;
-  }
-
-  // crude JSON parse: [{"name":"X","balance":123}]
-  int namePos = resp.indexOf("\"name\":\"");
-  if (namePos >= 0) {
-    namePos += 8;
-    int nameEnd = resp.indexOf("\"", namePos);
-    String name = resp.substring(namePos, nameEnd);
-
-    int balPos = resp.indexOf("\"balance\":");
-    String balStr = "";
-    if (balPos >= 0) {
-      balPos += 10;
-      int balEnd = resp.indexOf("}", balPos);
-      balStr = resp.substring(balPos, balEnd);
-    }
-
-    showLCD(name, "Bal: " + balStr);
-  } else {
-    showLCD("Parse error", "");
-  }
-}
-
-// ------------------- COMMAND HANDLING -------------------
-
-void handleCommand(const String &action, const String &payload) {
-  Serial.println("Handling cmd: " + action);
-
-  if (action == "start_rfid_scan") {
-    showLCD("Scan card...", "");
-    String uid;
-    unsigned long start = millis();
-    while (millis() - start < 15000) { // wait up to 15 seconds
-      if (readRFIDUID(uid)) {
-        Serial.println("Scanned UID: " + uid);
-        checkCustomerByRFID(uid);
-        break;
-      }
-      delay(50);
-    }
-  } else if (action == "show_info") {
-    showLCD("Company:", companyId);
-    delay(2000);
-    showLCD("Device:", deviceId);
-    delay(2000);
-  } else if (action == "force_wifi_setup") {
-    Serial.println("Forcing WiFi setup...");
-    showLCD("WiFi reset", "Rebooting...");
-    delay(1000);
-    // Clear WiFi settings then restart: next boot goes into portal
-    wm.resetSettings();
-    delay(500);
-    ESP.restart();
-  } else if (action == "pair_slave") {
-    // TODO: implement AP mode + slave pairing handshake
-    showLCD("Pair slave", "TODO");
-    delay(1500);
-  } else {
-    showLCD("Unknown cmd", action);
-    delay(1500);
-  }
-}
-
-// Poll backend for commands
-void pollCommands() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (!ensureJWT()) return;
-
-  String url = API_BASE + "/api/master/commands?device_id=" + deviceId; // TODO: implement backend
-  int code;
-  String resp = httpGetWithHeaders(url, "Authorization", "Bearer " + deviceJWT, "", "", &code);
-
-  if (code != 200) {
-    Serial.println("Cmd poll failed, HTTP " + String(code));
-    return;
-  }
-
-  // Expect JSON like:
-  // [ { "id": "...", "action": "start_rfid_scan", "payload": "{}" }, ... ]
-  if (resp == "[]" || resp.length() < 5) return;
-
-  int actPos = resp.indexOf("\"action\":\"");
-  if (actPos < 0) return;
-  actPos += 10;
-  int actEnd = resp.indexOf("\"", actPos);
-  String action = resp.substring(actPos, actEnd);
-
-  String payload = "{}"; // TODO: parse if needed
-
-  handleCommand(action, payload);
-
-  // TODO: mark command as processed via POST /api/master/commands/ack
-}
-
-// Send heartbeat
 void sendHeartbeat() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (!ensureJWT()) return;
+  if (deviceId == "" || deviceJWT == "") return;
 
-  String url = API_BASE + "/api/device/heartbeat"; // TODO: implement backend
-  String body = "{";
-  body += "\"device_id\":\"" + deviceId + "\",";
-  body += "\"device_type\":\"master\",";
-  body += "\"firmware_version\":\"1.0.0\"";
-  body += "}";
+  String body = "{\"device_id\":\"" + deviceId +
+                "\",\"device_type\":\"master\",\"firmware_version\":\"1.0.0\"}";
 
-  int code;
-  httpPostJSON(url, body, code); // ignoring response for now
+  String res;
+  httpPostJson(HEARTBEAT_PATH, body, res, true);
 }
 
-// ------------------- SETUP & LOOP -------------------
+// =============== COMMANDS ====================
+
+void ackCommand(String id) {
+  String body = "{\"command_id\":\"" + id + "\"}";
+  String res;
+  httpPostJson(COMMANDS_ACK_PATH, body, res, true);
+}
+
+void pollCommands() {
+  String url = String(API_BASE) + COMMANDS_PATH + "?device_id=" + deviceId;
+
+  String res;
+  if (!httpGet(url, res)) return;
+
+  int idx = res.indexOf("start_wifi_manager");
+  if (idx >= 0) {
+    int idStart = res.indexOf("\"id\":\"");
+    int idEnd = res.indexOf("\"", idStart + 6);
+    String cmdId = res.substring(idStart + 6, idEnd);
+
+    ackCommand(cmdId);
+    startWiFiAP("command");
+  }
+}
+
+// =============== RFID ========================
+
+String uidHex() {
+  String uid = "";
+  for (byte i=0; i<rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+void sendRFID(String uid) {
+  String body = "{\"rfid_uid\":\"" + uid +
+                "\",\"master_device_id\":\"" + deviceId + "\"}";
+
+  String res;
+  httpPostJson(NEW_RFID_PATH, body, res, true);
+}
+
+// =============== SETUP =======================
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  prefs.begin("master", false);
 
-  // LCD
   lcd.init();
   lcd.backlight();
-  showLCD("Master Device", "Booting...");
+  lcd.print("Booting...");
 
-  // RFID
-  SPI.begin(18, 19, 23, SS_PIN);
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
+
+  lcd.createChar(0, battery0);
+  lcd.createChar(1, battery1);
+  lcd.createChar(2, battery2);
+  lcd.createChar(3, battery3);
+  lcd.createChar(4, battery4);
+
+  SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, RFID_SS_PIN);
   rfid.PCD_Init();
 
-  // Load device state
-  loadState();
+  loadWifi();
+  loadAuth();
 
-  // WiFi provisioning (blocks until connected or timeout)
-  setupWiFi();
+  if (!connectWiFiStored())
+    startWiFiAP("no saved WiFi");
+  else {
+    if (deviceJWT == "" || deviceId == "")
+      deviceLogin();
 
-  // Ensure we have deviceId/companyId/JWT
-  if (deviceId.length() == 0 || companyId.length() == 0) {
-    showLCD("Device login...", "");
-    deviceLogin();
-  } else {
-    ensureJWT();
+    showCentered("Master Ready");
   }
-
-  showLCD("Ready", "Waiting cmds");
 }
+
+// =============== LOOP ========================
 
 void loop() {
   unsigned long now = millis();
 
-  // If WiFi drops, try to reconnect in background
-  if (WiFi.status() != WL_CONNECTED) {
-    // Non-blocking reconnect attempt
-    WiFi.reconnect();
+  if (wifiConfigMode) {
+    server.handleClient();
+    if (now - lastBatteryMs > BATTERY_INTERVAL_MS) {
+      lastBatteryMs = now;
+      updateBatteryIcon();
+    }
+    return;
   }
 
-  // Poll commands every 3 seconds
-  if (now - lastCommandPoll > 3000) {
-    lastCommandPoll = now;
-    pollCommands();
+  // Battery
+  if (now - lastBatteryMs > BATTERY_INTERVAL_MS) {
+    lastBatteryMs = now;
+    updateBatteryIcon();
   }
 
-  // Send heartbeat every 60 seconds
-  if (now - lastHeartbeat > 60000) {
-    lastHeartbeat = now;
+  // Heartbeat
+  if (now - lastHeartbeatMs > HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatMs = now;
     sendHeartbeat();
   }
 
-  // Everything else is command-driven from dashboard
+  // Command polling
+  if (now - lastCommandPollMs > COMMANDS_INTERVAL_MS) {
+    lastCommandPollMs = now;
+    pollCommands();
+  }
+
+  // RFID
+  if (!rfid.PICC_IsNewCardPresent()) return;
+  if (!rfid.PICC_ReadCardSerial())   return;
+
+  String uid = uidHex();
+
+  if (uid != lastSentUID) {
+    lastSentUID = uid;
+    showCentered("Card UID:", uid);
+    delay(400);
+    sendRFID(uid);
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
 }
