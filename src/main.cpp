@@ -1,10 +1,9 @@
 /*******************************************************
  * MASTER DEVICE FIRMWARE (Option A - Strict)
+ * - Uses Supabase Edge Functions as backend
  * - Uses tzapu WiFiManager (captive portal)
  * - Auto WiFi setup page with footer hint
- * - Device MUST login to backend or it will not run RFID
- * - RFID UID sent to backend /api/master/new-rfid
- * - Heartbeat + command polling (start_wifi_manager)
+ * - Device MUST login to backend before RFID/commands work
  *******************************************************/
 
 #include <Arduino.h>
@@ -27,7 +26,7 @@
 #define BATTERY_PIN   34
 
 // ================= LCD =========================
-LiquidCrystal_I2C lcd(0x27, 16, 2);  // change 0x27 to 0x3F if needed
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // TODO: change 0x27 to 0x3F if your LCD uses that
 
 // Battery icons
 byte battery0[8] = {B01110,B10001,B10001,B10001,B10001,B10001,B10001,B11111};
@@ -37,26 +36,30 @@ byte battery3[8] = {B01110,B10001,B10001,B11111,B11111,B11111,B11111,B11111};
 byte battery4[8] = {B01110,B11111,B11111,B11111,B11111,B11111,B11111,B11111};
 
 // =============== BACKEND CONFIG ===============
-// TODO: CHANGE THIS to your Lovable backend
-const char* API_BASE = "https://your-backend-url.com";
+// ✅ TODO 1: Supabase Edge Functions base URL
+const char* API_BASE = "https://djodwbvntdlamhydpuih.supabase.co/functions/v1";
 
-const char* DEVICE_LOGIN_PATH   = "/api/device/login";
-const char* HEARTBEAT_PATH      = "/api/device/heartbeat";
-const char* NEW_RFID_PATH       = "/api/master/new-rfid";
-const char* COMMANDS_PATH       = "/api/master/commands";
-const char* COMMANDS_ACK_PATH   = "/api/master/commands/ack";
+// Edge Function paths
+const char* DEVICE_LOGIN_PATH   = "/device-login";
+const char* HEARTBEAT_PATH      = "/device-heartbeat";
+const char* NEW_RFID_PATH       = "/master-new-rfid";
+const char* COMMANDS_PATH       = "/master-commands";
+const char* COMMANDS_ACK_PATH   = "/master-commands-ack";
 
 // =============== DEVICE IDENTITY ===============
 Preferences prefs;
 
-// TODO: CHANGE THIS per device (must match what you register in DB)
+// ✅ TODO 2: Unique serial per MASTER device (must match DB)
 String deviceSerial = "MASTER_001";
+
+// ✅ TODO 3: Device secret (must match what you store for this device in DB)
+String deviceSecret = "CHANGE_ME_DEVICE_SECRET";
 
 String deviceId  = "";
 String companyId = "";
 String deviceJWT = "";
 
-bool isLoggedIn = false;   // strict mode: must be true before RFID/commands
+bool isLoggedIn = false;   // strict: must be true before RFID & commands
 
 // =============== RFID =========================
 MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
@@ -171,12 +174,14 @@ bool httpPostJson(const char* path, String body, String &response, bool auth = t
   }
 
   HTTPClient http;
-  String url = String(API_BASE) + path;
+  String url = String(API_BASE) + String(path);
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
 
-  if (auth && deviceJWT.length())
+  // For all endpoints except device-login, use device JWT as Bearer token
+  if (auth && deviceJWT.length()) {
     http.addHeader("Authorization", "Bearer " + deviceJWT);
+  }
 
   Serial.println("POST " + url);
   Serial.println("Body: " + body);
@@ -196,7 +201,7 @@ bool httpPostJson(const char* path, String body, String &response, bool auth = t
   return (code >= 200 && code < 300);
 }
 
-bool httpGet(String url, String &response) {
+bool httpGetFull(String url, String &response, bool auth = true) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("HTTP GET: WiFi not connected");
     return false;
@@ -205,11 +210,11 @@ bool httpGet(String url, String &response) {
   HTTPClient http;
   http.begin(url);
 
-  if (deviceJWT.length())
+  if (auth && deviceJWT.length()) {
     http.addHeader("Authorization", "Bearer " + deviceJWT);
+  }
 
   Serial.println("GET " + url);
-
   int code = http.GET();
   if (code <= 0) {
     Serial.println("HTTP GET failed, code: " + String(code));
@@ -230,35 +235,32 @@ bool httpGet(String url, String &response) {
 void setupWiFi() {
   WiFiManager wm;
 
-  // Force config portal if cannot connect
   wm.setDebugOutput(true);
 
-  // Make AP stable & discoverable
+  // Give AP a fixed IP to help captive portal detection
   wm.setAPStaticIPConfig(
     IPAddress(192,168,4,1),
     IPAddress(192,168,4,1),
     IPAddress(255,255,255,0)
   );
 
-  // 5 minutes timeout for portal
+  // 5 minutes timeout for config portal
   wm.setTimeout(300);
 
-  // Called when config portal starts
   wm.setAPCallback([](WiFiManager *wmPtr) {
     Serial.println("CONFIG PORTAL ACTIVE!");
   });
 
-  // Add footer-like text (note: shown at top; WiFiManager injects this into the page)
+  // Footer-like text on WiFi config page
   wm.setCustomHeadElement(
     "<div style='text-align:center;font-size:13px;margin-top:10px;'>"
     "Or connect manually: <b>http://192.168.4.1</b>"
     "</div>"
   );
-  // NOTE: Use http://, not https:// — ESP32 does not host HTTPS
 
   showCentered("WiFi Setup...", "");
 
-  // AP SSID: MASTER_001_Setup etc
+  // AP SSID: e.g. MASTER_001_Setup
   String apName = deviceSerial + "_Setup";
 
   bool res = wm.autoConnect(apName.c_str(), "12345678");
@@ -266,9 +268,8 @@ void setupWiFi() {
   if (!res) {
     Serial.println("WiFiManager: failed or timed out");
     showCentered("WiFi Failed", "Restart needed");
-    // strict: cannot proceed without WiFi
     while (true) {
-      delay(1000);
+      delay(1000); // strict: block forever
     }
   } else {
     Serial.print("WiFi connected: ");
@@ -283,19 +284,21 @@ void setupWiFi() {
 bool deviceLogin() {
   String body =
     "{\"device_serial\":\"" + deviceSerial +
-    "\",\"device_type\":\"master\"}";
+    "\",\"device_type\":\"master\"" +
+    ",\"device_secret\":\"" + deviceSecret + "\"}";
 
   String res;
   Serial.println("Attempting device login for serial: " + deviceSerial);
 
+  // Login has NO Authorization header
   if (!httpPostJson(DEVICE_LOGIN_PATH, body, res, false)) {
-    Serial.println("HTTP ERROR: could not reach backend.");
+    Serial.println("HTTP ERROR: could not reach device-login function.");
     return false;
   }
 
   Serial.println("Login response: " + res);
 
-  // Basic error detection (backend should send error field if not registered)
+  // Basic backend error detection
   if (res.indexOf("error") >= 0) {
     Serial.println("Backend error: " + res);
     return false;
@@ -330,8 +333,7 @@ void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   String body =
-    "{\"device_id\":\"" + deviceId +
-    "\",\"device_type\":\"master\",\"firmware_version\":\"1.0.0\"}";
+    "{\"firmware_version\":\"1.0.0\"}";
 
   String res;
   httpPostJson(HEARTBEAT_PATH, body, res, true);
@@ -340,6 +342,8 @@ void sendHeartbeat() {
 // ================== COMMANDS ====================
 
 void ackCommand(String id) {
+  if (!isLoggedIn) return;
+
   String body = "{\"command_id\":\"" + id + "\"}";
   String res;
   httpPostJson(COMMANDS_ACK_PATH, body, res, true);
@@ -348,27 +352,30 @@ void ackCommand(String id) {
 void pollCommands() {
   if (!isLoggedIn) return;
   if (WiFi.status() != WL_CONNECTED) return;
-  if (deviceId == "") return;
 
-  String url = String(API_BASE) + COMMANDS_PATH + "?device_id=" + deviceId;
+  String url = String(API_BASE) + String(COMMANDS_PATH);
 
   String res;
-  if (!httpGet(url, res)) return;
+  if (!httpGetFull(url, res, true)) return;
 
-  // Look for "start_wifi_manager" command
-  if (res.indexOf("start_wifi_manager") >= 0) {
+  // Expecting something like: { "commands": [ { "id": "...", "action": "start_wifi_manager", ... } ] }
+  int idxAction = res.indexOf("start_wifi_manager");
+  if (idxAction >= 0) {
+    // Extract command id
+    int idKey = res.indexOf("\"id\":\"");
+    if (idKey > 0) {
+      int idStart = idKey + 6;
+      int idEnd   = res.indexOf("\"", idStart);
+      String cmdId = res.substring(idStart, idEnd);
 
-    int idStart = res.indexOf("\"id\":\"") + 6;
-    int idEnd   = res.indexOf("\"", idStart);
-    String cmdId = res.substring(idStart, idEnd);
-
-    ackCommand(cmdId);
+      ackCommand(cmdId);
+    }
 
     showCentered("WiFi Reset", "Rebooting");
     delay(600);
 
     WiFiManager wm;
-    wm.resetSettings();   // clear stored WiFi creds
+    wm.resetSettings();   // clear stored WiFi credentials
     delay(500);
     ESP.restart();
   }
@@ -429,10 +436,10 @@ void setup() {
 
   loadAuth();
 
-  // 1) WiFi provisioning (blocking until connected)
+  // 1) WiFi provisioning (blocking until connected or fatal fail)
   setupWiFi();
 
-  // 2) Strict: must login to backend
+  // 2) STRICT: must login to backend
   bool loggedIn = false;
   int attempts = 0;
 
@@ -455,8 +462,7 @@ void setup() {
 
   if (!loggedIn) {
     showCentered("Login Failed", "Check Backend");
-    Serial.println("FATAL: device could not authenticate. Stopping.");
-    // strict: halt device
+    Serial.println("FATAL: Device could not authenticate. Halting.");
     while (true) {
       delay(1000);
     }
@@ -468,7 +474,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Battery
+  // Battery icon
   if (now - lastBatteryMs > BATTERY_INTERVAL_MS) {
     lastBatteryMs = now;
     updateBatteryIcon();
@@ -486,11 +492,12 @@ void loop() {
     pollCommands();
   }
 
-  // RFID only if logged in (strict mode)
+  // STRICT: no RFID if not logged in
   if (!isLoggedIn) return;
+
   if (WiFi.status() != WL_CONNECTED) {
-    showCentered("No WiFi", "RFID blocked");
-    delay(500);
+    // Optionally warn on LCD
+    // showCentered("No WiFi", "RFID paused");
     return;
   }
 
